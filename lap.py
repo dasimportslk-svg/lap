@@ -1,650 +1,1193 @@
-#!/usr/bin/env python3
-
 import os
-import subprocess
-import shutil
+import time
+import threading
 import tkinter as tk
-from tkinter import ttk, messagebox
-from pathlib import Path
+from tkinter import ttk, messagebox, filedialog, simpledialog
 
-LAPTOP_IP = "172.18.57.102"
-LAPTOP_USER = "NEW SMART PC"
+import paramiko
 
-MOUNT_ROOT = "/tmp/lap_mount"
-PI_ROOT = "/home/pi"
+from PIL import Image, ImageDraw, ImageFont
+from luma.core.interface.serial import i2c
+from luma.oled.device import ssd1306
 
-class LaptopFileManager:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("DH Laptop File Manager")
-        self.root.geometry("900x600")
 
-        self.current_path = None
-        self.mounts = {}
+OLED_ADDRESS = 0x3C
+OLED_WIDTH = 128
+OLED_HEIGHT = 64
 
-        os.makedirs(MOUNT_ROOT, exist_ok=True)
+SFTP_PORT = 22
 
-        self.build_ui()
-        self.load_shares()
+serial = i2c(
+    port=1,
+    address=OLED_ADDRESS
+)
 
-    def build_ui(self):
-        top = tk.Frame(self.root)
-        top.pack(fill="x", padx=8, pady=8)
+oled = ssd1306(
+    serial,
+    width=OLED_WIDTH,
+    height=OLED_HEIGHT
+)
 
-        tk.Label(
-            top,
-            text=f"Laptop: {LAPTOP_IP}",
-            font=("Arial", 12, "bold")
-        ).pack(side="left")
+oled_lock = threading.Lock()
 
-        tk.Button(
-            top,
-            text="Refresh",
-            command=self.load_shares
-        ).pack(side="right", padx=5)
+try:
+    font_small = ImageFont.truetype(
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 9
+    )
+    font_tiny = ImageFont.truetype(
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 7
+    )
+    font_big = ImageFont.truetype(
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 13
+    )
+except:
+    font_small = ImageFont.load_default()
+    font_tiny = ImageFont.load_default()
+    font_big = ImageFont.load_default()
 
-        tk.Button(
-            top,
-            text="Back",
-            command=self.go_back
-        ).pack(side="right", padx=5)
 
-        self.path_label = tk.Label(
-            self.root,
-            text="Shares",
-            anchor="w"
-        )
-        self.path_label.pack(fill="x", padx=10)
+ssh_client = None
+sftp = None
 
-        frame = tk.Frame(self.root)
-        frame.pack(fill="both", expand=True, padx=8, pady=5)
+current_path = "."
+current_items = []
 
-        self.tree = ttk.Treeview(
-            frame,
-            columns=("type", "size"),
-            show="tree headings"
-        )
+download_running = False
 
-        self.tree.heading("#0", text="Name")
-        self.tree.heading("type", text="Type")
-        self.tree.heading("size", text="Size")
 
-        self.tree.column("#0", width=550)
-        self.tree.column("type", width=120)
-        self.tree.column("size", width=150)
+def oled_show(title, line1="", line2="", percent=None, animated=False):
+    with oled_lock:
+        img = Image.new("1", (OLED_WIDTH, OLED_HEIGHT), 0)
+        draw = ImageDraw.Draw(img)
 
-        scroll = ttk.Scrollbar(
-            frame,
-            orient="vertical",
-            command=self.tree.yview
+        draw.text(
+            (2, 1),
+            title[:20],
+            font=font_small,
+            fill=255
         )
 
-        self.tree.configure(yscrollcommand=scroll.set)
-
-        self.tree.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-
-        self.tree.bind("<Double-1>", self.double_click)
-
-        bottom = tk.Frame(self.root)
-        bottom.pack(fill="x", padx=8, pady=8)
-
-        tk.Button(
-            bottom,
-            text="Download",
-            width=15,
-            command=self.download_selected
-        ).pack(side="left", padx=5)
-
-        tk.Button(
-            bottom,
-            text="Open",
-            width=15,
-            command=self.open_selected
-        ).pack(side="left", padx=5)
-
-        tk.Button(
-            bottom,
-            text="Refresh",
-            width=15,
-            command=self.refresh
-        ).pack(side="left", padx=5)
-
-        self.status = tk.Label(
-            self.root,
-            text="Ready",
-            anchor="w"
+        draw.line(
+            (0, 13, 127, 13),
+            fill=255
         )
-        self.status.pack(fill="x", padx=10, pady=(0, 8))
 
-    def clear_tree(self):
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        draw.text(
+            (2, 17),
+            line1[:21],
+            font=font_small,
+            fill=255
+        )
 
-    def load_shares(self):
-        self.clear_tree()
-        self.current_path = None
-        self.path_label.config(text="Laptop Shares")
-        self.status.config(text="Connecting...")
+        draw.text(
+            (2, 29),
+            line2[:21],
+            font=font_tiny,
+            fill=255
+        )
+
+        if percent is not None:
+            p = max(0, min(100, percent))
+
+            draw.rectangle(
+                (2, 43, 125, 53),
+                outline=255
+            )
+
+            width = int(119 * p / 100)
+
+            if width > 0:
+                draw.rectangle(
+                    (4, 45, 4 + width, 51),
+                    fill=255
+                )
+
+            draw.text(
+                (45, 55),
+                f"{p:.0f}%",
+                font=font_tiny,
+                fill=255
+            )
+
+        elif animated:
+            dots = int(time.time() * 3) % 4
+            text = "." * dots
+
+            draw.text(
+                (2, 43),
+                text,
+                font=font_big,
+                fill=255
+            )
+
+        oled.display(img)
+
+
+def oled_idle():
+    oled_show(
+        "DH SFTP",
+        "Laptop File Transfer",
+        "Waiting...",
+        animated=True
+    )
+
+
+def oled_connecting(ip):
+    oled_show(
+        "CONNECTING",
+        ip,
+        "SFTP port 22",
+        animated=True
+    )
+
+
+def oled_connected(ip):
+    oled_show(
+        "CONNECTED",
+        ip,
+        "SFTP READY"
+    )
+
+
+def oled_error(text):
+    oled_show(
+        "ERROR",
+        text[:21],
+        "Check connection"
+    )
+
+
+def oled_download(filename, percent, transferred, total):
+    if total:
+        mb1 = transferred / 1024 / 1024
+        mb2 = total / 1024 / 1024
+        line2 = f"{mb1:.1f}/{mb2:.1f} MB"
+    else:
+        line2 = "Unknown size"
+
+    with oled_lock:
+        img = Image.new("1", (128, 64), 0)
+        draw = ImageDraw.Draw(img)
+
+        draw.text(
+            (2, 1),
+            "DOWNLOADING",
+            font=font_small,
+            fill=255
+        )
+
+        draw.line(
+            (0, 13, 127, 13),
+            fill=255
+        )
+
+        name = os.path.basename(filename)
+
+        if len(name) > 20:
+            name = name[-20:]
+
+        draw.text(
+            (2, 17),
+            name,
+            font=font_tiny,
+            fill=255
+        )
+
+        draw.text(
+            (2, 29),
+            line2,
+            font=font_tiny,
+            fill=255
+        )
+
+        p = max(0, min(100, percent))
+
+        draw.rectangle(
+            (2, 40, 125, 51),
+            outline=255
+        )
+
+        width = int(119 * p / 100)
+
+        if width > 0:
+            draw.rectangle(
+                (4, 42, 4 + width, 49),
+                fill=255
+            )
+
+        draw.text(
+            (48, 54),
+            f"{p:.0f}%",
+            font=font_tiny,
+            fill=255
+        )
+
+        oled.display(img)
+
+
+def oled_complete(filename):
+    oled_show(
+        "COMPLETE",
+        os.path.basename(filename)[:21],
+        "Download finished"
+    )
+
+
+def normalize_path(path):
+    if not path:
+        return "."
+
+    return path
+
+
+def connect_sftp(ip, username, password):
+    global ssh_client
+    global sftp
+
+    try:
+        oled_connecting(ip)
+
+        ssh_client = paramiko.SSHClient()
+        ssh_client.set_missing_host_key_policy(
+            paramiko.AutoAddPolicy()
+        )
+
+        ssh_client.connect(
+            hostname=ip,
+            port=SFTP_PORT,
+            username=username,
+            password=password,
+            timeout=10,
+            banner_timeout=10,
+            auth_timeout=10
+        )
+
+        sftp = ssh_client.open_sftp()
+
+        oled_connected(ip)
+
+        return True, ""
+
+    except Exception as e:
+        ssh_client = None
+        sftp = None
+
+        oled_error(str(e)[:21])
+
+        return False, str(e)
+
+
+def disconnect_sftp():
+    global ssh_client
+    global sftp
+
+    try:
+        if sftp:
+            sftp.close()
+    except:
+        pass
+
+    try:
+        if ssh_client:
+            ssh_client.close()
+    except:
+        pass
+
+    sftp = None
+    ssh_client = None
+
+
+def format_size(size):
+    if size < 1024:
+        return f"{size} B"
+
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+
+    if size < 1024 * 1024 * 1024:
+        return f"{size / 1024 / 1024:.1f} MB"
+
+    return f"{size / 1024 / 1024 / 1024:.2f} GB"
+
+
+def get_remote_items(path):
+    global sftp
+
+    items = []
+
+    for attr in sftp.listdir_attr(path):
+        name = attr.filename
+
+        if name in [".", ".."]:
+            continue
+
+        is_dir = False
 
         try:
-            cmd = [
-                "smbclient",
-                "-L",
-                f"//{LAPTOP_IP}",
-                "-U",
-                LAPTOP_USER
-            ]
+            import stat
+            is_dir = stat.S_ISDIR(attr.st_mode)
+        except:
+            pass
 
-            result = subprocess.run(
-                cmd,
-                input="\n",
-                text=True,
-                capture_output=True
+        items.append({
+            "name": name,
+            "path": os.path.join(path, name).replace("\\", "/"),
+            "is_dir": is_dir,
+            "size": attr.st_size
+        })
+
+    items.sort(
+        key=lambda x: (
+            not x["is_dir"],
+            x["name"].lower()
+        )
+    )
+
+    return items
+
+
+def refresh_files():
+    global current_items
+
+    if not sftp:
+        return
+
+    try:
+        current_items = get_remote_items(current_path)
+
+        tree.delete(*tree.get_children())
+
+        for item in current_items:
+            if item["is_dir"]:
+                icon = "📁"
+                size = ""
+                kind = "Folder"
+            else:
+                icon = "📄"
+                size = format_size(item["size"])
+                kind = "File"
+
+            tree.insert(
+                "",
+                "end",
+                values=(
+                    icon + " " + item["name"],
+                    kind,
+                    size
+                )
             )
 
-            output = result.stdout
+        path_var.set(current_path)
 
-            shares = []
-
-            for line in output.splitlines():
-                parts = line.split()
-
-                if len(parts) >= 2:
-                    name = parts[0]
-                    typ = parts[1]
-
-                    if typ == "Disk":
-                        if not name.endswith("$"):
-                            shares.append(name)
-
-                        elif name in ("C$", "E$", "D$", "F$", "G$"):
-                            shares.append(name)
-
-            if not shares:
-                self.status.config(
-                    text="No shares found. Check SMB/password."
-                )
-                return
-
-            for share in sorted(set(shares)):
-                self.tree.insert(
-                    "",
-                    "end",
-                    text=share,
-                    values=("Drive/Folder", "")
-                )
-
-            self.status.config(
-                text=f"{len(set(shares))} shares found"
-            )
-
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-
-    def get_selected(self):
-        selection = self.tree.selection()
-
-        if not selection:
-            return None
-
-        item = selection[0]
-        name = self.tree.item(item, "text")
-
-        return name
-
-    def mount_share(self, share):
-        if share in self.mounts:
-            return self.mounts[share]
-
-        mount_point = os.path.join(
-            MOUNT_ROOT,
-            share.replace("$", "_")
+    except Exception as e:
+        messagebox.showerror(
+            "SFTP Error",
+            str(e)
         )
 
-        os.makedirs(mount_point, exist_ok=True)
 
-        if os.path.ismount(mount_point):
-            self.mounts[share] = mount_point
-            return mount_point
+def go_back():
+    global current_path
 
-        cmd = [
-            "sudo",
-            "mount",
-            "-t",
-            "cifs",
-            f"//{LAPTOP_IP}/{share}",
-            mount_point,
-            "-o",
-            f'username={LAPTOP_USER},vers=3.0'
-        ]
+    if current_path in [".", "/"]:
+        return
 
-        result = subprocess.run(
-            cmd,
-            text=True,
-            capture_output=True
+    parent = os.path.dirname(current_path)
+
+    if not parent:
+        parent = "."
+
+    current_path = parent
+
+    refresh_files()
+
+
+def open_selected(event=None):
+    global current_path
+
+    selected = tree.selection()
+
+    if not selected:
+        return
+
+    index = tree.index(selected[0])
+
+    if index >= len(current_items):
+        return
+
+    item = current_items[index]
+
+    if item["is_dir"]:
+        current_path = item["path"]
+        refresh_files()
+
+
+def selected_file():
+    selected = tree.selection()
+
+    if not selected:
+        return None
+
+    index = tree.index(selected[0])
+
+    if index >= len(current_items):
+        return None
+
+    item = current_items[index]
+
+    if item["is_dir"]:
+        return None
+
+    return item
+
+
+def download_file():
+    global download_running
+
+    if download_running:
+        return
+
+    item = selected_file()
+
+    if not item:
+        messagebox.showwarning(
+            "Select File",
+            "Please select a file."
+        )
+        return
+
+    destination = filedialog.askdirectory(
+        title="Choose Pi Destination Folder",
+        initialdir="/home/pi"
+    )
+
+    if not destination:
+        return
+
+    filename = item["name"]
+
+    local_path = os.path.join(
+        destination,
+        filename
+    )
+
+    if os.path.exists(local_path):
+        answer = messagebox.askyesno(
+            "File Exists",
+            f"{filename}\nalready exists.\n\nOverwrite?"
         )
 
-        if result.returncode != 0:
-            messagebox.showerror(
-                "Mount Error",
-                result.stderr
-            )
-            return None
-
-        self.mounts[share] = mount_point
-
-        return mount_point
-
-    def show_directory(self, path):
-        self.clear_tree()
-        self.current_path = path
-
-        self.path_label.config(
-            text=path
-        )
-
-        try:
-            entries = list(Path(path).iterdir())
-
-            dirs = sorted(
-                [x for x in entries if x.is_dir()],
-                key=lambda x: x.name.lower()
-            )
-
-            files = sorted(
-                [x for x in entries if x.is_file()],
-                key=lambda x: x.name.lower()
-            )
-
-            for entry in dirs:
-                self.tree.insert(
-                    "",
-                    "end",
-                    text=entry.name,
-                    values=("Folder", "")
-                )
-
-            for entry in files:
-                try:
-                    size = entry.stat().st_size
-                    size_text = self.format_size(size)
-                except:
-                    size_text = ""
-
-                self.tree.insert(
-                    "",
-                    "end",
-                    text=entry.name,
-                    values=("File", size_text)
-                )
-
-            self.status.config(
-                text=f"{len(entries)} items"
-            )
-
-        except PermissionError:
-            messagebox.showerror(
-                "Permission",
-                "Permission denied."
-            )
-
-        except Exception as e:
-            messagebox.showerror(
-                "Error",
-                str(e)
-            )
-
-    def double_click(self, event):
-        item = self.tree.selection()
-
-        if not item:
+        if not answer:
             return
 
-        name = self.tree.item(
-            item[0],
-            "text"
-        )
+    download_running = True
 
-        typ = self.tree.item(
-            item[0],
-            "values"
-        )[0]
+    download_button.config(
+        state="disabled"
+    )
 
-        if self.current_path is None:
-            mount = self.mount_share(name)
+    refresh_button.config(
+        state="disabled"
+    )
 
-            if mount:
-                self.show_directory(mount)
+    back_button.config(
+        state="disabled"
+    )
 
-            return
+    progress_var.set(0)
+    percent_label.config(text="0%")
+    speed_label.config(text="Starting...")
 
-        if typ == "Folder":
-            new_path = os.path.join(
-                self.current_path,
-                name
+    thread = threading.Thread(
+        target=download_worker,
+        args=(
+            item["path"],
+            local_path,
+            item["size"],
+            filename
+        ),
+        daemon=True
+    )
+
+    thread.start()
+
+
+def download_worker(
+    remote_path,
+    local_path,
+    total_size,
+    filename
+):
+    global download_running
+
+    start_time = time.time()
+    last_oled = 0
+
+    try:
+
+        def progress_callback(transferred, total):
+            nonlocal last_oled
+
+            if total > 0:
+                percent = (
+                    transferred / total
+                ) * 100
+            else:
+                percent = 0
+
+            elapsed = time.time() - start_time
+
+            if elapsed > 0:
+                speed = (
+                    transferred / elapsed
+                )
+
+                if speed >= 1024 * 1024:
+                    speed_text = (
+                        f"{speed / 1024 / 1024:.2f} MB/s"
+                    )
+                else:
+                    speed_text = (
+                        f"{speed / 1024:.1f} KB/s"
+                    )
+            else:
+                speed_text = "Starting..."
+
+            root.after(
+                0,
+                update_progress,
+                percent,
+                speed_text
             )
 
-            self.show_directory(new_path)
+            now = time.time()
 
-        elif typ == "File":
-            self.download_selected()
+            if (
+                now - last_oled >= 0.15
+                or transferred >= total
+            ):
+                last_oled = now
 
-    def go_back(self):
-        if self.current_path is None:
-            return
+                oled_download(
+                    filename,
+                    percent,
+                    transferred,
+                    total
+                )
 
-        parent = os.path.dirname(
-            self.current_path.rstrip("/")
+        sftp.get(
+            remote_path,
+            local_path,
+            callback=progress_callback,
+            prefetch=True
         )
 
-        mount_root = os.path.dirname(
-            self.current_path
+        oled_complete(filename)
+
+        root.after(
+            0,
+            download_finished,
+            True,
+            f"Downloaded:\n{local_path}"
         )
 
-        if parent == MOUNT_ROOT:
-            self.load_shares()
-        else:
-            self.show_directory(parent)
+    except Exception as e:
 
-    def open_selected(self):
-        item = self.tree.selection()
-
-        if not item or self.current_path is None:
-            return
-
-        name = self.tree.item(
-            item[0],
-            "text"
+        oled_error(
+            str(e)[:21]
         )
 
-        path = os.path.join(
-            self.current_path,
-            name
+        root.after(
+            0,
+            download_finished,
+            False,
+            str(e)
         )
 
-        if os.path.isdir(path):
-            self.show_directory(path)
+    finally:
+        download_running = False
 
-        elif os.path.isfile(path):
-            subprocess.Popen(
-                ["xdg-open", path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
 
-    def download_selected(self):
-        item = self.tree.selection()
+def update_progress(percent, speed):
+    progress_var.set(percent)
 
-        if not item or self.current_path is None:
+    percent_label.config(
+        text=f"{percent:.1f}%"
+    )
+
+    speed_label.config(
+        text=speed
+    )
+
+
+def download_finished(success, message):
+    download_button.config(
+        state="normal"
+    )
+
+    refresh_button.config(
+        state="normal"
+    )
+
+    back_button.config(
+        state="normal"
+    )
+
+    if success:
+        progress_var.set(100)
+        percent_label.config(text="100%")
+        speed_label.config(text="Completed")
+
+        messagebox.showinfo(
+            "Download Complete",
+            message
+        )
+
+    else:
+        messagebox.showerror(
+            "Download Error",
+            message
+        )
+
+
+def login_window():
+    login = tk.Toplevel(root)
+    login.title("SFTP Login")
+    login.geometry("380x240")
+    login.resizable(False, False)
+
+    login.transient(root)
+    login.grab_set()
+
+    tk.Label(
+        login,
+        text="Laptop IP",
+        font=("Arial", 11)
+    ).pack(
+        pady=(18, 3)
+    )
+
+    ip_entry = tk.Entry(
+        login,
+        font=("Arial", 12),
+        width=28
+    )
+
+    ip_entry.pack()
+
+    ip_entry.insert(
+        0,
+        ip_var.get()
+    )
+
+    tk.Label(
+        login,
+        text="Windows Username",
+        font=("Arial", 11)
+    ).pack(
+        pady=(10, 3)
+    )
+
+    user_entry = tk.Entry(
+        login,
+        font=("Arial", 12),
+        width=28
+    )
+
+    user_entry.pack()
+
+    tk.Label(
+        login,
+        text="Windows Password",
+        font=("Arial", 11)
+    ).pack(
+        pady=(10, 3)
+    )
+
+    pass_entry = tk.Entry(
+        login,
+        font=("Arial", 12),
+        width=28,
+        show="*"
+    )
+
+    pass_entry.pack()
+
+    status = tk.Label(
+        login,
+        text="",
+        font=("Arial", 9)
+    )
+
+    status.pack(
+        pady=5
+    )
+
+    def do_connect():
+
+        ip = ip_entry.get().strip()
+        username = user_entry.get().strip()
+        password = pass_entry.get()
+
+        if not ip:
             messagebox.showwarning(
-                "Select File",
-                "Select a file first."
+                "IP Required",
+                "Enter laptop IP address.",
+                parent=login
             )
             return
 
-        name = self.tree.item(
-            item[0],
-            "text"
-        )
-
-        typ = self.tree.item(
-            item[0],
-            "values"
-        )[0]
-
-        if typ != "File":
+        if not username:
             messagebox.showwarning(
-                "Select File",
-                "Please select a file."
+                "Username Required",
+                "Enter Windows username.",
+                parent=login
             )
             return
 
-        source = os.path.join(
-            self.current_path,
-            name
+        connect_button.config(
+            state="disabled"
         )
 
-        self.destination_window(source, name)
-
-    def destination_window(self, source, filename):
-        win = tk.Toplevel(self.root)
-        win.title("Download Destination")
-        win.geometry("600x450")
-        win.transient(self.root)
-        win.grab_set()
-
-        tk.Label(
-            win,
-            text="Select Raspberry Pi destination",
-            font=("Arial", 12, "bold")
-        ).pack(pady=10)
-
-        tree = ttk.Treeview(
-            win,
-            columns=("path",),
-            show="tree"
+        status.config(
+            text="Connecting..."
         )
 
-        tree.pack(
-            fill="both",
-            expand=True,
-            padx=10,
-            pady=5
-        )
+        def worker():
 
-        root_item = tree.insert(
-            "",
-            "end",
-            text="/home/pi",
-            values=("/home/pi",)
-        )
+            ok, error = connect_sftp(
+                ip,
+                username,
+                password
+            )
 
-        def add_dirs(parent, path):
-            try:
-                dirs = sorted(
-                    [
-                        x for x in Path(path).iterdir()
-                        if x.is_dir()
-                        and not x.name.startswith(".")
-                    ],
-                    key=lambda x: x.name.lower()
+            def finish():
+
+                connect_button.config(
+                    state="normal"
                 )
 
-                for d in dirs:
-                    child = tree.insert(
-                        parent,
-                        "end",
-                        text=d.name,
-                        values=(str(d),)
+                if ok:
+
+                    ip_var.set(ip)
+
+                    login.grab_release()
+                    login.destroy()
+
+                    global current_path
+                    current_path = "."
+
+                    refresh_files()
+
+                    connection_status.config(
+                        text=f"Connected: {ip}"
                     )
 
-                    add_dirs(
-                        child,
-                        str(d)
+                    oled_connected(ip)
+
+                else:
+
+                    status.config(
+                        text="Connection failed"
                     )
 
-            except:
-                pass
+                    messagebox.showerror(
+                        "SFTP Connection Failed",
+                        error,
+                        parent=login
+                    )
 
-        add_dirs(
-            root_item,
-            PI_ROOT
-        )
-
-        tree.item(
-            root_item,
-            open=True
-        )
-
-        button_frame = tk.Frame(win)
-        button_frame.pack(
-            fill="x",
-            padx=10,
-            pady=10
-        )
-
-        progress = ttk.Progressbar(
-            win,
-            mode="determinate"
-        )
-        progress.pack(
-            fill="x",
-            padx=10,
-            pady=5
-        )
-
-        status = tk.Label(
-            win,
-            text="Ready"
-        )
-        status.pack(
-            pady=5
-        )
-
-        def do_download():
-            selected = tree.selection()
-
-            if not selected:
-                messagebox.showwarning(
-                    "Destination",
-                    "Select a destination folder."
-                )
-                return
-
-            destination = tree.item(
-                selected[0],
-                "values"
-            )[0]
-
-            target = os.path.join(
-                destination,
-                filename
+            root.after(
+                0,
+                finish
             )
 
-            if os.path.exists(target):
-                answer = messagebox.askyesno(
-                    "File Exists",
-                    f"{filename} already exists.\nReplace it?"
-                )
+        threading.Thread(
+            target=worker,
+            daemon=True
+        ).start()
 
-                if not answer:
-                    return
+    connect_button = tk.Button(
+        login,
+        text="OK",
+        font=("Arial", 11, "bold"),
+        width=12,
+        command=do_connect
+    )
 
-            try:
-                total = os.path.getsize(source)
+    connect_button.pack(
+        pady=5
+    )
 
-                progress["value"] = 0
-                progress["maximum"] = total
+    ip_entry.focus()
 
-                copied = 0
-                chunk = 1024 * 1024
+    login.bind(
+        "<Return>",
+        lambda e: do_connect()
+    )
 
-                with open(
-                    source,
-                    "rb"
-                ) as src, open(
-                    target,
-                    "wb"
-                ) as dst:
 
-                    while True:
-                        data = src.read(chunk)
+def change_ip():
+    login_window()
 
-                        if not data:
-                            break
 
-                        dst.write(data)
+def on_close():
+    disconnect_sftp()
 
-                        copied += len(data)
+    try:
+        oled.clear()
+    except:
+        pass
 
-                        progress["value"] = copied
+    root.destroy()
 
-                        percent = (
-                            copied / total * 100
-                            if total
-                            else 100
-                        )
 
-                        status.config(
-                            text=f"Downloading... {percent:.1f}%"
-                        )
+root = tk.Tk()
 
-                        win.update_idletasks()
+root.title(
+    "DH Laptop SFTP Transfer"
+)
 
-                status.config(
-                    text="Download completed"
-                )
+root.geometry(
+    "850x600"
+)
 
-                messagebox.showinfo(
-                    "Completed",
-                    f"Downloaded successfully:\n\n{target}"
-                )
+root.minsize(
+    700,
+    500
+)
 
-                win.destroy()
+root.protocol(
+    "WM_DELETE_WINDOW",
+    on_close
+)
 
-            except Exception as e:
-                messagebox.showerror(
-                    "Download Error",
-                    str(e)
-                )
 
-        tk.Button(
-            button_frame,
-            text="CANCEL",
-            width=12,
-            command=win.destroy
-        ).pack(
-            side="right",
-            padx=5
+# =========================
+# TOP BAR
+# =========================
+
+top_frame = tk.Frame(
+    root,
+    padx=10,
+    pady=8
+)
+
+top_frame.pack(
+    fill="x"
+)
+
+tk.Label(
+    top_frame,
+    text="Laptop IP:",
+    font=("Arial", 11, "bold")
+).pack(
+    side="left"
+)
+
+
+ip_var = tk.StringVar(
+    value="172.18.57.102"
+)
+
+ip_entry_main = tk.Entry(
+    top_frame,
+    textvariable=ip_var,
+    font=("Arial", 12),
+    width=20
+)
+
+ip_entry_main.pack(
+    side="left",
+    padx=8
+)
+
+
+connect_top_button = tk.Button(
+    top_frame,
+    text="OK",
+    font=("Arial", 10, "bold"),
+    width=8,
+    command=login_window
+)
+
+connect_top_button.pack(
+    side="left"
+)
+
+
+connection_status = tk.Label(
+    top_frame,
+    text="Not Connected",
+    font=("Arial", 10)
+)
+
+connection_status.pack(
+    side="left",
+    padx=15
+)
+
+
+# =========================
+# PATH BAR
+# =========================
+
+path_frame = tk.Frame(
+    root,
+    padx=10
+)
+
+path_frame.pack(
+    fill="x"
+)
+
+tk.Label(
+    path_frame,
+    text="Remote Path:"
+).pack(
+    side="left"
+)
+
+path_var = tk.StringVar(
+    value="."
+)
+
+path_entry = tk.Entry(
+    path_frame,
+    textvariable=path_var,
+    font=("Arial", 10)
+)
+
+path_entry.pack(
+    side="left",
+    fill="x",
+    expand=True,
+    padx=8
+)
+
+path_entry.bind(
+    "<Return>",
+    lambda e: path_from_entry()
+)
+
+
+def path_from_entry():
+    global current_path
+
+    if not sftp:
+        return
+
+    path = path_var.get().strip()
+
+    if not path:
+        path = "."
+
+    try:
+        sftp.stat(path)
+
+        current_path = path
+
+        refresh_files()
+
+    except Exception as e:
+        messagebox.showerror(
+            "Path Error",
+            str(e)
         )
 
-        tk.Button(
-            button_frame,
-            text="OK - DOWNLOAD",
-            width=18,
-            command=do_download
-        ).pack(
-            side="right",
-            padx=5
-        )
 
-    def refresh(self):
-        if self.current_path:
-            self.show_directory(
-                self.current_path
-            )
-        else:
-            self.load_shares()
+# =========================
+# FILE LIST
+# =========================
 
-    @staticmethod
-    def format_size(size):
-        units = [
-            "B",
-            "KB",
-            "MB",
-            "GB",
-            "TB"
-        ]
+list_frame = tk.Frame(
+    root,
+    padx=10,
+    pady=10
+)
 
-        value = float(size)
+list_frame.pack(
+    fill="both",
+    expand=True
+)
 
-        for unit in units:
-            if value < 1024:
-                return f"{value:.1f} {unit}"
+columns = (
+    "name",
+    "type",
+    "size"
+)
 
-            value /= 1024
+tree = ttk.Treeview(
+    list_frame,
+    columns=columns,
+    show="headings",
+    selectmode="browse"
+)
 
-        return f"{value:.1f} PB"
+tree.heading(
+    "name",
+    text="Name"
+)
+
+tree.heading(
+    "type",
+    text="Type"
+)
+
+tree.heading(
+    "size",
+    text="Size"
+)
+
+tree.column(
+    "name",
+    width=500
+)
+
+tree.column(
+    "type",
+    width=100
+)
+
+tree.column(
+    "size",
+    width=120
+)
+
+scrollbar = ttk.Scrollbar(
+    list_frame,
+    orient="vertical",
+    command=tree.yview
+)
+
+tree.configure(
+    yscrollcommand=scrollbar.set
+)
+
+tree.pack(
+    side="left",
+    fill="both",
+    expand=True
+)
+
+scrollbar.pack(
+    side="right",
+    fill="y"
+)
+
+tree.bind(
+    "<Double-1>",
+    open_selected
+)
 
 
-def main():
-    root = tk.Tk()
+# =========================
+# BUTTON BAR
+# =========================
 
-    app = LaptopFileManager(root)
+button_frame = tk.Frame(
+    root,
+    pady=8
+)
 
-    root.mainloop()
+button_frame.pack(
+    fill="x"
+)
+
+back_button = tk.Button(
+    button_frame,
+    text="← Back",
+    width=12,
+    command=go_back
+)
+
+back_button.pack(
+    side="left",
+    padx=5
+)
 
 
-if __name__ == "__main__":
-    main()
+refresh_button = tk.Button(
+    button_frame,
+    text="⟳ Refresh",
+    width=12,
+    command=refresh_files
+)
+
+refresh_button.pack(
+    side="left",
+    padx=5
+)
+
+
+download_button = tk.Button(
+    button_frame,
+    text="⬇ Download",
+    width=16,
+    font=("Arial", 10, "bold"),
+    command=download_file
+)
+
+download_button.pack(
+    side="left",
+    padx=5
+)
+
+
+# =========================
+# PROGRESS
+# =========================
+
+progress_frame = tk.Frame(
+    root,
+    padx=10,
+    pady=5
+)
+
+progress_frame.pack(
+    fill="x"
+)
+
+progress_var = tk.DoubleVar(
+    value=0
+)
+
+progress_bar = ttk.Progressbar(
+    progress_frame,
+    variable=progress_var,
+    maximum=100
+)
+
+progress_bar.pack(
+    side="left",
+    fill="x",
+    expand=True
+)
+
+
+percent_label = tk.Label(
+    progress_frame,
+    text="0%",
+    width=7,
+    font=("Arial", 10, "bold")
+)
+
+percent_label.pack(
+    side="left"
+)
+
+
+speed_label = tk.Label(
+    root,
+    text="Ready",
+    font=("Arial", 9)
+)
+
+speed_label.pack(
+    pady=(0, 8)
+)
+
+
+oled_idle()
+
+root.mainloop()
